@@ -1,0 +1,5 @@
+.venv/
+.envrc
+.ignore/
+__pycache__/
+

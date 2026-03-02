@@ -1,0 +1,4 @@
+export STRAVA_CLIENT_ID="your_client_id"
+export STRAVA_CLIENT_SECRET="your_client_secret"
+export STRAVA_REFRESH_TOKEN="your_refresh_token"
+
