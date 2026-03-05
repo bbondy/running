@@ -1,4 +1,8 @@
+# Option 1 (recommended to match go-brianbondy workflow):
+# export STRAVA_ACCESS_TOKEN="your_access_token"
+
+# Option 2 (refresh-token flow):
 export STRAVA_CLIENT_ID="your_client_id"
 export STRAVA_CLIENT_SECRET="your_client_secret"
-export STRAVA_REFRESH_TOKEN="your_refresh_token"
-
+# Optional if you already have one; otherwise the script can open browser OAuth:
+# export STRAVA_REFRESH_TOKEN="your_refresh_token"

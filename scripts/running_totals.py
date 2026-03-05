@@ -5,24 +5,32 @@ import argparse
 import json
 import os
 import sys
+import threading
+import time
+import webbrowser
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 
-STRAVA_OAUTH_URL = "https://www.strava.com/api/v3/oauth/token"
+STRAVA_AUTH_URL = "https://www.strava.com/oauth/authorize"
+STRAVA_TOKEN_URL = "https://www.strava.com/oauth/token"
 STRAVA_ACTIVITIES_URL = "https://www.strava.com/api/v3/athlete/activities"
+REDIRECT_URI = "http://localhost:8080/"
 
 
 @dataclass
 class Config:
-    client_id: str
-    client_secret: str
-    refresh_token: str
+    access_token: str | None
+    client_id: str | None
+    client_secret: str | None
+    refresh_token: str | None
+    token_cache_file: Path
     cache_file: Path
     force_refresh: bool
     cache_max_age_hours: int
@@ -64,24 +72,31 @@ def parse_iso_date(value: str) -> date:
 
 
 def load_config(args: argparse.Namespace) -> Config:
-    missing = [
-        name
-        for name in ("STRAVA_CLIENT_ID", "STRAVA_CLIENT_SECRET", "STRAVA_REFRESH_TOKEN")
-        if not os.getenv(name)
-    ]
-    if missing:
+    access_token = os.getenv("STRAVA_ACCESS_TOKEN")
+    client_id = os.getenv("STRAVA_CLIENT_ID")
+    client_secret = os.getenv("STRAVA_CLIENT_SECRET")
+    refresh_token = os.getenv("STRAVA_REFRESH_TOKEN")
+
+    has_client_creds = all((client_id, client_secret))
+    has_refresh_flow = has_client_creds and bool(refresh_token)
+    if not access_token and not has_client_creds and not has_refresh_flow:
         raise SystemExit(
-            "Missing required environment variable(s): "
-            f"{', '.join(missing)}. Set them in .envrc and run `direnv allow`."
+            "Missing Strava auth configuration. Provide either:\n"
+            "1) STRAVA_ACCESS_TOKEN\n"
+            "or\n"
+            "2) STRAVA_CLIENT_ID + STRAVA_CLIENT_SECRET (+ optional STRAVA_REFRESH_TOKEN)\n"
+            "Set them in .envrc and run `direnv allow`."
         )
 
     cache_dir = Path(".ignore")
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     return Config(
-        client_id=os.environ["STRAVA_CLIENT_ID"],
-        client_secret=os.environ["STRAVA_CLIENT_SECRET"],
-        refresh_token=os.environ["STRAVA_REFRESH_TOKEN"],
+        access_token=access_token,
+        client_id=client_id,
+        client_secret=client_secret,
+        refresh_token=refresh_token,
+        token_cache_file=cache_dir / "strava_token.json",
         cache_file=cache_dir / "strava_activities.json",
         force_refresh=args.refresh_cache,
         cache_max_age_hours=args.cache_max_age_hours,
@@ -105,14 +120,37 @@ def http_json_request(url: str, method: str = "GET", data: dict[str, Any] | None
             return json.loads(payload)
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
+        if exc.code == 401:
+            try:
+                parsed = json.loads(detail)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict):
+                errors = parsed.get("errors")
+                if isinstance(errors, list):
+                    for err in errors:
+                        if (
+                            isinstance(err, dict)
+                            and err.get("field") == "activity:read_permission"
+                            and err.get("code") == "missing"
+                        ):
+                            raise SystemExit(
+                                "Strava token is missing activity scope. "
+                                "Re-authorize with `activity:read_all` (or `activity:read`) "
+                                "and update STRAVA_ACCESS_TOKEN or STRAVA_REFRESH_TOKEN."
+                            ) from exc
         raise SystemExit(f"Strava API error {exc.code}: {detail}") from exc
     except URLError as exc:
         raise SystemExit(f"Failed to reach Strava API: {exc}") from exc
 
 
 def fetch_access_token(cfg: Config) -> str:
+    if not cfg.client_id or not cfg.client_secret or not cfg.refresh_token:
+        raise SystemExit(
+            "Refresh-token auth requires STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET, and STRAVA_REFRESH_TOKEN."
+        )
     payload = http_json_request(
-        STRAVA_OAUTH_URL,
+        STRAVA_TOKEN_URL,
         method="POST",
         data={
             "client_id": cfg.client_id,
@@ -121,10 +159,127 @@ def fetch_access_token(cfg: Config) -> str:
             "refresh_token": cfg.refresh_token,
         },
     )
+    scope = str(payload.get("scope") or "")
+    has_required_scope = "activity:read_all" in scope or "activity:read" in scope
+    if scope and not has_required_scope:
+        raise SystemExit(
+            f"Refresh token scope is `{scope}` but needs `activity:read_all` or `activity:read`."
+        )
     token = payload.get("access_token")
     if not token:
         raise SystemExit("Strava OAuth response did not include an access_token.")
     return token
+
+
+class OAuthHandler(BaseHTTPRequestHandler):
+    code: str | None = None
+
+    def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+        code = params.get("code", [None])[0]
+        if code:
+            OAuthHandler.code = code
+            self.send_response(200)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"<h1>Authorization successful. You can close this window.</h1>")
+        else:
+            self.send_response(400)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"<h1>Authorization failed.</h1>")
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A003
+        # Keep CLI output clean during OAuth callback.
+        return
+
+
+def load_cached_access_token(cfg: Config) -> str | None:
+    if not cfg.token_cache_file.exists():
+        return None
+    try:
+        payload = json.loads(cfg.token_cache_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    token = payload.get("access_token")
+    if isinstance(token, str) and token:
+        return token
+    return None
+
+
+def save_token_cache(cfg: Config, token_payload: dict[str, Any]) -> None:
+    try:
+        cfg.token_cache_file.write_text(json.dumps(token_payload, indent=2), encoding="utf-8")
+    except OSError:
+        # Non-fatal: continue without local token cache.
+        return
+
+
+def run_oauth_browser_flow(cfg: Config) -> str:
+    if not cfg.client_id or not cfg.client_secret:
+        raise SystemExit("Browser OAuth requires STRAVA_CLIENT_ID and STRAVA_CLIENT_SECRET.")
+
+    OAuthHandler.code = None
+    server = HTTPServer(("localhost", 8080), OAuthHandler)
+    thread = threading.Thread(target=server.handle_request, daemon=True)
+    thread.start()
+
+    params = {
+        "client_id": cfg.client_id,
+        "redirect_uri": REDIRECT_URI,
+        "response_type": "code",
+        "scope": "activity:read_all",
+        "approval_prompt": "auto",
+    }
+    auth_url = f"{STRAVA_AUTH_URL}?{urlencode(params)}"
+    print(f"Opening browser for Strava login: {auth_url}")
+    webbrowser.open(auth_url)
+
+    timeout_seconds = 180
+    elapsed = 0.0
+    while OAuthHandler.code is None and elapsed < timeout_seconds:
+        time.sleep(0.2)
+        elapsed += 0.2
+    server.server_close()
+
+    if OAuthHandler.code is None:
+        raise SystemExit("Timed out waiting for Strava OAuth callback on http://localhost:8080/")
+
+    payload = http_json_request(
+        STRAVA_TOKEN_URL,
+        method="POST",
+        data={
+            "client_id": cfg.client_id,
+            "client_secret": cfg.client_secret,
+            "code": OAuthHandler.code,
+            "grant_type": "authorization_code",
+        },
+    )
+    if not isinstance(payload, dict):
+        raise SystemExit("Unexpected OAuth token response format.")
+
+    save_token_cache(cfg, payload)
+    token = payload.get("access_token")
+    if not token:
+        raise SystemExit("Strava OAuth response did not include an access_token.")
+    return str(token)
+
+
+def resolve_access_token(cfg: Config) -> str:
+    if cfg.access_token:
+        return cfg.access_token
+
+    if cfg.refresh_token and cfg.client_id and cfg.client_secret:
+        return fetch_access_token(cfg)
+
+    cached = load_cached_access_token(cfg)
+    if cached:
+        return cached
+
+    return run_oauth_browser_flow(cfg)
 
 
 def fetch_all_activities(access_token: str) -> list[dict[str, Any]]:
@@ -222,7 +377,7 @@ def main() -> int:
     activities = load_cached_activities(cfg)
     cache_used = activities is not None
     if activities is None:
-        token = fetch_access_token(cfg)
+        token = resolve_access_token(cfg)
         activities = fetch_all_activities(token)
         write_cache(cfg.cache_file, activities)
 
@@ -261,4 +416,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
